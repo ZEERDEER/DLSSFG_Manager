@@ -1,0 +1,24 @@
+# Build output
+bin/
+obj/
+artifacts/
+publish/
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
+
+# Runtime data created next to the executable (settings, cache, backups, crash log)
+data/
+crash.log
+
+# Test / temp
+TestResults/
+*.log
+*.tmp
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini

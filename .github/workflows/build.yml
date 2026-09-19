@@ -1,0 +1,52 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build
+        run: dotnet build DLSSFG_Manager.sln -c Release
+
+      - name: Test
+        run: dotnet run --project Manager.Tests -c Release --no-build
+
+      - name: Publish (self-contained)
+        run: dotnet publish Manager.App -c Release -r win-x64 --self-contained true -o publish/full -p:DebugType=none
+
+      - name: Publish (framework-dependent)
+        run: dotnet publish Manager.App -c Release -r win-x64 --self-contained false -o publish/lite -p:DebugType=none
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF.Substring(11) } else { 'dev' }
+          Compress-Archive -Path publish/full/* -DestinationPath "DLSSFG-Manager-$version-win-x64.zip"
+          Compress-Archive -Path publish/lite/* -DestinationPath "DLSSFG-Manager-$version-win-x64-lite.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DLSSFG-Manager
+          path: "*.zip"
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.zip"
+          generate_release_notes: true

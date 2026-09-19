@@ -1,0 +1,20 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <PlatformTarget>x64</PlatformTarget>
+    <DebugType>portable</DebugType>
+    <Version>1.0.0</Version>
+    <Authors>ZEERDEER</Authors>
+    <Company>ZEERDEER</Company>
+    <Copyright>Copyright (c) 2026 ZEERDEER</Copyright>
+    <RepositoryUrl>https://github.com/ZEERDEER/DLSSFG_Manager</RepositoryUrl>
+    <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
+    <!-- Lets the Windows-only projects build on Linux/macOS CI boxes too. -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <!-- WFO1000 is a designer-serialization hint; this app has no designer files. -->
+    <NoWarn>$(NoWarn);WFO1000</NoWarn>
+  </PropertyGroup>
+</Project>

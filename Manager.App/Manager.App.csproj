@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>DLSSFG Manager</AssemblyName>
+    <RootNamespace>Sm86.Manager.App</RootNamespace>
+    <Product>DLSSFG Manager</Product>
+    <Description>Portable manager for the dlssg_for_sm86 DLSS Frame Generation patch: scan games, pick the proxy DLL, install / update / uninstall with backups.</Description>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <UseAppHost>true</UseAppHost>
+  </PropertyGroup>
+  <ItemGroup><ProjectReference Include="../Manager.Core/Manager.Core.csproj" /></ItemGroup>
+</Project>
