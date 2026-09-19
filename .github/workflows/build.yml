@@ -26,11 +26,11 @@ jobs:
       - name: Test
         run: dotnet run --project Manager.Tests -c Release --no-build
 
-      - name: Publish (self-contained)
-        run: dotnet publish Manager.App -c Release -r win-x64 --self-contained true -o publish/full -p:DebugType=none
+      - name: Publish (single-file, self-contained)
+        run: dotnet publish Manager.App -c Release -r win-x64 --self-contained true -o publish/full
 
-      - name: Publish (framework-dependent)
-        run: dotnet publish Manager.App -c Release -r win-x64 --self-contained false -o publish/lite -p:DebugType=none
+      - name: Publish (single-file, framework-dependent)
+        run: dotnet publish Manager.App -c Release -r win-x64 --self-contained false -o publish/lite
 
       - name: Package
         shell: pwsh

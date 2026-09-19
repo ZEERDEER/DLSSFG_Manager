@@ -22,10 +22,10 @@ Grab a build from [Releases](https://github.com/ZEERDEER/DLSSFG_Manager/releases
 
 | File | Notes |
 |---|---|
-| `DLSSFG-Manager-x.y.z-win-x64.zip` | Self-contained: unzip and run, no runtime to install (~110 MB). |
-| `DLSSFG-Manager-x.y.z-win-x64-lite.zip` | ~1 MB, requires the [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (Windows x64). |
+| `DLSSFG-Manager-x.y.z-win-x64.zip` | A single `DLSSFG Manager.exe` (~47 MB) with the runtime built in: unzip and run, nothing to install. |
+| `DLSSFG-Manager-x.y.z-win-x64-lite.zip` | A single exe (~1 MB) that needs the [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (Windows x64); if it is missing, the app points you to the download. |
 
-Requires Windows 10 1809+ or Windows 11, 64-bit. Extract anywhere writable and start `DLSSFG Manager.exe`. Settings, cache, backups and install records live in the `data` folder next to the executable — the whole folder is portable.
+Requires Windows 10 1809+ or Windows 11, 64-bit. Put the exe anywhere writable and start it. Settings, cache, backups and install records live in a `data` folder next to the executable — move them together and everything stays portable.
 
 ## How to use
 
@@ -56,8 +56,8 @@ git clone https://github.com/ZEERDEER/DLSSFG_Manager.git
 cd DLSSFG_Manager
 dotnet build DLSSFG_Manager.sln
 dotnet run --project Manager.Tests          # tests have no Windows dependency and also run on Linux
-dotnet publish Manager.App -c Release -r win-x64 --self-contained true  -o publish\full
-dotnet publish Manager.App -c Release -r win-x64 --self-contained false -o publish\lite
+dotnet publish Manager.App -c Release -r win-x64 --self-contained true  -o publish\full   # single file, runtime included
+dotnet publish Manager.App -c Release -r win-x64 --self-contained false -o publish\lite   # single file, uses the installed runtime
 ```
 
 ```

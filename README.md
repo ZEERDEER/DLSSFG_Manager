@@ -22,10 +22,10 @@
 
 | 文件 | 说明 |
 |---|---|
-| `DLSSFG-Manager-x.y.z-win-x64.zip` | 自包含版，解压即用，无需安装任何运行时（约 110 MB）。 |
-| `DLSSFG-Manager-x.y.z-win-x64-lite.zip` | 精简版（约 1 MB），需要先安装 [.NET 10 桌面运行时](https://dotnet.microsoft.com/download/dotnet/10.0)（Windows x64，"Desktop Runtime"）。 |
+| `DLSSFG-Manager-x.y.z-win-x64.zip` | 单个 `DLSSFG Manager.exe`（约 47 MB），运行时已内置，解压即用、无需安装。 |
+| `DLSSFG-Manager-x.y.z-win-x64-lite.zip` | 单个 exe（约 1 MB），需要先安装 [.NET 10 桌面运行时](https://dotnet.microsoft.com/download/dotnet/10.0)（Windows x64，"Desktop Runtime"）；没装的话启动时会给出下载链接。 |
 
-系统要求：Windows 10 1809 或更新 / Windows 11，64 位。解压到任意可写目录后运行 `DLSSFG Manager.exe`；设置、缓存、备份和安装记录都保存在同目录的 `data` 文件夹里，整个文件夹可以随意搬走。
+系统要求：Windows 10 1809 或更新 / Windows 11，64 位。把 exe 放到任意可写目录运行即可；设置、缓存、备份和安装记录都保存在同目录的 `data` 文件夹里，连同 exe 一起可以随意搬走。
 
 ## 使用步骤
 
@@ -56,8 +56,8 @@ git clone https://github.com/ZEERDEER/DLSSFG_Manager.git
 cd DLSSFG_Manager
 dotnet build DLSSFG_Manager.sln
 dotnet run --project Manager.Tests          # 运行测试（不依赖 Windows，Linux 上也能跑）
-dotnet publish Manager.App -c Release -r win-x64 --self-contained true  -o publish\full
-dotnet publish Manager.App -c Release -r win-x64 --self-contained false -o publish\lite
+dotnet publish Manager.App -c Release -r win-x64 --self-contained true  -o publish\full   # 单文件，内置运行时
+dotnet publish Manager.App -c Release -r win-x64 --self-contained false -o publish\lite   # 单文件，依赖已安装的运行时
 ```
 
 ```

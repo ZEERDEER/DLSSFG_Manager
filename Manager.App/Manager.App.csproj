@@ -13,6 +13,9 @@
     <SelfContained>false</SelfContained>
     <InvariantGlobalization>false</InvariantGlobalization>
     <UseAppHost>true</UseAppHost>
+    <!-- dotnet publish produces one compressed executable; the self-contained switch chooses the flavor. -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <EnableCompressionInSingleFile Condition="'$(SelfContained)' == 'true'">true</EnableCompressionInSingleFile>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../Manager.Core/Manager.Core.csproj" /></ItemGroup>
 </Project>
