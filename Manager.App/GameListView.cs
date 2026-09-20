@@ -8,10 +8,10 @@ using System.Windows.Forms;
 namespace Sm86.Manager.App
 {
     /// <summary>
-    /// The whole game list drawn by one control: no child windows per row, so the window paints atomically
-    /// (no half-painted frames during restore animations or layout changes) and every element follows the palette.
+    /// The whole game list drawn by one control with its own scrolling: no child windows per row, so the window paints
+    /// atomically, and all coordinates are computed in client space (GDI text and GDI+ shapes stay aligned when scrolled).
     /// </summary>
-    public sealed class GameListView : ScrollableControl
+    public sealed class GameListView : Control
     {
         public sealed class Row
         {
@@ -25,7 +25,7 @@ namespace Sm86.Manager.App
             public string Tooltip = "";
         }
 
-        private enum Part { None, Card, Check, Proxy, Primary, Uninstall }
+        private enum Part { None, Card, Check, Proxy, Primary, Uninstall, Thumb }
 
         private readonly List<Row> _rows = new List<Row>();
         private int _hoverRow = -1, _pressRow = -1;
@@ -33,6 +33,11 @@ namespace Sm86.Manager.App
         private readonly ToolTip _tip = new ToolTip { InitialDelay = 400, ReshowDelay = 200 };
         private string _tipShown = "";
         private Font _nameFont, _pathFont, _glyphFont;
+
+        // scrolling
+        private int _scrollY;
+        private bool _thumbHover, _thumbDrag;
+        private int _dragStartY, _dragStartScroll;
 
         public event Action<Row, bool> CheckedChanged;
         public event Action<Row, Rectangle> ProxyClicked;      // rectangle in screen coordinates (menu anchor)
@@ -42,7 +47,7 @@ namespace Sm86.Manager.App
         public GameListView()
         {
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
-            AutoScroll = true; BackColor = Palette.Window; TabStop = true;
+            BackColor = Palette.Window; TabStop = true;
         }
 
         public IReadOnlyList<Row> Rows => _rows;
@@ -51,10 +56,10 @@ namespace Sm86.Manager.App
         {
             _rows.Clear(); _rows.AddRange(rows);
             _hoverRow = -1; _hoverPart = Part.None;
-            UpdateExtent(); Invalidate();
+            ClampScroll(); Invalidate();
         }
 
-        public void RefreshRow(Row row) { int i = _rows.IndexOf(row); if (i >= 0) Invalidate(ToClient(CardRect(i))); }
+        public void RefreshRow(Row row) { int i = _rows.IndexOf(row); if (i >= 0) Invalidate(CardRect(i)); }
         public void RefreshAll() => Invalidate();
         public Row RowFor(GameEntry game) => _rows.FirstOrDefault(r => r.Game == game);
 
@@ -64,21 +69,25 @@ namespace Sm86.Manager.App
         private int RowHeight => S(66);
         private int Gap => S(8);
         private int Pitch => RowHeight + Gap;
+        private int TopPad => S(2);
+        private int ContentHeight => _rows.Count == 0 ? 0 : TopPad + _rows.Count * Pitch - Gap + S(4);
+        private int MaxScroll => Math.Max(0, ContentHeight - ClientSize.Height);
+        private bool ScrollbarVisible => MaxScroll > 0;
+        private int ScrollbarLane => S(14);
 
-        private void UpdateExtent()
-        {
-            AutoScrollMinSize = new Size(0, _rows.Count * Pitch + S(4));
-        }
-
-        protected override void OnResize(EventArgs e) { base.OnResize(e); UpdateExtent(); }
+        protected override void OnResize(EventArgs e) { base.OnResize(e); ClampScroll(); }
         protected override void OnFontChanged(EventArgs e) { base.OnFontChanged(e); _nameFont?.Dispose(); _pathFont?.Dispose(); _glyphFont?.Dispose(); _nameFont = _pathFont = _glyphFont = null; }
 
         private Font NameFont => _nameFont ?? (_nameFont = new Font(Font.FontFamily, 11f, FontStyle.Bold));
         private Font PathFont => _pathFont ?? (_pathFont = new Font(Font.FontFamily, 8.5f));
         private Font GlyphFont => _glyphFont ?? (_glyphFont = new Font("Segoe MDL2 Assets", 8f));
 
-        /// <summary>Card rectangle in content (unscrolled) coordinates.</summary>
-        private Rectangle CardRect(int index) => new Rectangle(0, S(2) + index * Pitch, Math.Max(S(500), ClientSize.Width), RowHeight);
+        /// <summary>Card rectangle in client coordinates (scroll already applied).</summary>
+        private Rectangle CardRect(int index)
+        {
+            int width = Math.Max(S(500), ClientSize.Width - (ScrollbarVisible ? ScrollbarLane : 0));
+            return new Rectangle(0, TopPad + index * Pitch - _scrollY, width, RowHeight);
+        }
 
         private struct Cells { public Rectangle Card, Check, Icon, Text, Version, Status, Proxy, Primary, Uninstall; }
 
@@ -100,8 +109,63 @@ namespace Sm86.Manager.App
             return c;
         }
 
-        private Rectangle ToClient(Rectangle content) { content.Offset(AutoScrollPosition.X, AutoScrollPosition.Y); return content; }
-        private Point ToContent(Point client) => new Point(client.X - AutoScrollPosition.X, client.Y - AutoScrollPosition.Y);
+        // ------------------------------------------------------------------ scrolling
+
+        private void ClampScroll()
+        {
+            int clamped = Math.Max(0, Math.Min(_scrollY, MaxScroll));
+            if (clamped != _scrollY) { _scrollY = clamped; Invalidate(); }
+        }
+
+        private void ScrollTo(int y)
+        {
+            int clamped = Math.Max(0, Math.Min(y, MaxScroll));
+            if (clamped == _scrollY) return;
+            _scrollY = clamped;
+            Invalidate();
+            RefreshHover(PointToClient(MousePosition));
+        }
+
+        private Rectangle TrackRect => new Rectangle(ClientSize.Width - ScrollbarLane, S(2), ScrollbarLane, Math.Max(0, ClientSize.Height - S(4)));
+
+        private Rectangle ThumbRect()
+        {
+            if (!ScrollbarVisible) return Rectangle.Empty;
+            var track = TrackRect;
+            int thumbH = Math.Max(S(28), (int)((long)track.Height * ClientSize.Height / Math.Max(1, ContentHeight)));
+            int travel = Math.Max(0, track.Height - thumbH);
+            int y = track.Y + (MaxScroll == 0 ? 0 : (int)((long)travel * _scrollY / MaxScroll));
+            int w = _thumbHover || _thumbDrag ? S(8) : S(5);
+            return new Rectangle(track.Right - S(4) - w, y, w, thumbH);
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            int lines = SystemInformation.MouseWheelScrollLines;
+            int step = lines <= 0 ? ClientSize.Height : Math.Max(Pitch, lines * S(24));
+            ScrollTo(_scrollY - Math.Sign(e.Delta) * step * Math.Max(1, Math.Abs(e.Delta) / 120));
+        }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            switch (keyData & Keys.KeyCode) { case Keys.Up: case Keys.Down: case Keys.PageUp: case Keys.PageDown: case Keys.Home: case Keys.End: return true; }
+            return base.IsInputKey(keyData);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            switch (e.KeyCode)
+            {
+                case Keys.Down: ScrollTo(_scrollY + Pitch); e.Handled = true; break;
+                case Keys.Up: ScrollTo(_scrollY - Pitch); e.Handled = true; break;
+                case Keys.PageDown: ScrollTo(_scrollY + ClientSize.Height - Pitch); e.Handled = true; break;
+                case Keys.PageUp: ScrollTo(_scrollY - ClientSize.Height + Pitch); e.Handled = true; break;
+                case Keys.Home: ScrollTo(0); e.Handled = true; break;
+                case Keys.End: ScrollTo(MaxScroll); e.Handled = true; break;
+            }
+        }
 
         // ------------------------------------------------------------------ painting
 
@@ -113,10 +177,19 @@ namespace Sm86.Manager.App
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
-            g.TranslateTransform(AutoScrollPosition.X, AutoScrollPosition.Y);
-            var clip = e.ClipRectangle; clip.Offset(-AutoScrollPosition.X, -AutoScrollPosition.Y);
-            int first = Math.Max(0, (clip.Top - S(2)) / Pitch), last = Math.Min(_rows.Count - 1, (clip.Bottom - S(2)) / Pitch);
+            int first = Math.Max(0, (e.ClipRectangle.Top + _scrollY - TopPad) / Pitch), last = Math.Min(_rows.Count - 1, (e.ClipRectangle.Bottom + _scrollY - TopPad) / Pitch);
             for (int i = first; i <= last; i++) DrawRow(g, i);
+            DrawScrollbar(g);
+        }
+
+        private void DrawScrollbar(Graphics g)
+        {
+            if (!ScrollbarVisible) return;
+            var thumb = ThumbRect();
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var path = IconProvider.RoundedRect(thumb, thumb.Width / 2))
+            using (var b = new SolidBrush(Color.FromArgb(_thumbDrag ? 200 : _thumbHover ? 160 : 90, Palette.Muted)))
+                g.FillPath(b, path);
         }
 
         private void DrawRow(Graphics g, int i)
@@ -177,9 +250,8 @@ namespace Sm86.Manager.App
             using (var b = new SolidBrush(row.StatusDot)) g.FillEllipse(b, c.Status.X, c.Status.Y + (c.Status.Height - dot) / 2, dot, dot);
             TextRenderer.DrawText(g, row.StatusText, Font, new Rectangle(c.Status.X + dot + S(8), c.Status.Y, c.Status.Width - dot - S(8), c.Status.Height), Palette.Text, line);
 
-            // proxy picker
+            // proxy picker + actions
             DrawButton(g, c.Proxy, row.Game.SelectedProxy, false, Palette.Text, hover && _hoverPart == Part.Proxy, row.Busy, true);
-            // actions
             DrawButton(g, c.Primary, row.PrimaryText, row.PrimaryIsAccent, row.PrimaryIsAccent ? Palette.AccentText : Palette.Text, hover && _hoverPart == Part.Primary, row.Busy, false);
             if (row.ShowUninstall) DrawButton(g, c.Uninstall, "卸载", false, Palette.Danger, hover && _hoverPart == Part.Uninstall, row.Busy, false);
         }
@@ -199,7 +271,7 @@ namespace Sm86.Manager.App
             {
                 var textRect = new Rectangle(rect.X + S(10), rect.Y, rect.Width - S(30), rect.Height);
                 TextRenderer.DrawText(g, text, Font, textRect, textColor, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
-                TextRenderer.DrawText(g, "\uE70D", GlyphFont, new Rectangle(rect.Right - S(24), rect.Y, S(20), rect.Height), disabled ? Palette.Muted : Palette.Muted, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                TextRenderer.DrawText(g, "\uE70D", GlyphFont, new Rectangle(rect.Right - S(24), rect.Y, S(20), rect.Height), Palette.Muted, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             }
             else
                 TextRenderer.DrawText(g, text, Font, rect, textColor, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
@@ -207,11 +279,11 @@ namespace Sm86.Manager.App
 
         // ------------------------------------------------------------------ hit testing / mouse
 
-        private (int row, Part part) HitTest(Point client)
+        private (int row, Part part) HitTest(Point p)
         {
-            var p = ToContent(client);
-            int index = (p.Y - S(2)) / Pitch;
-            if (p.Y < S(2) || index < 0 || index >= _rows.Count) return (-1, Part.None);
+            if (ScrollbarVisible && Rectangle.Inflate(ThumbRect(), S(6), 0).Contains(p)) return (-1, Part.Thumb);
+            int index = (p.Y + _scrollY - TopPad) / Pitch;
+            if (p.Y + _scrollY < TopPad || index < 0 || index >= _rows.Count) return (-1, Part.None);
             var c = RowCells(index);
             if (!c.Card.Contains(p)) return (-1, Part.None);
             var row = _rows[index];
@@ -222,19 +294,33 @@ namespace Sm86.Manager.App
             return (index, Part.Card);
         }
 
-        protected override void OnMouseMove(MouseEventArgs e)
+        private void RefreshHover(Point client)
         {
-            base.OnMouseMove(e);
-            var (row, part) = HitTest(e.Location);
+            if (_thumbDrag) return;
+            var (row, part) = HitTest(client);
+            bool thumb = part == Part.Thumb;
+            if (thumb != _thumbHover) { _thumbHover = thumb; Invalidate(TrackRect); }
             if (row != _hoverRow || part != _hoverPart)
             {
                 int old = _hoverRow; _hoverRow = row; _hoverPart = part;
-                if (old >= 0 && old < _rows.Count) Invalidate(ToClient(CardRect(old)));
-                if (row >= 0) Invalidate(ToClient(CardRect(row)));
+                if (old >= 0 && old < _rows.Count) Invalidate(CardRect(old));
+                if (row >= 0) Invalidate(CardRect(row));
                 bool busy = row >= 0 && _rows[row].Busy;
                 Cursor = !busy && (part == Part.Check || part == Part.Proxy || part == Part.Primary || part == Part.Uninstall) ? Cursors.Hand : Cursors.Default;
                 UpdateTooltip(row, part);
             }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (_thumbDrag)
+            {
+                var track = TrackRect; int thumbH = ThumbRect().Height; int travel = Math.Max(1, track.Height - thumbH);
+                ScrollTo(_dragStartScroll + (int)((long)(e.Y - _dragStartY) * MaxScroll / travel));
+                return;
+            }
+            RefreshHover(e.Location);
         }
 
         private void UpdateTooltip(int row, Part part)
@@ -254,8 +340,9 @@ namespace Sm86.Manager.App
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
-            if (_hoverRow >= 0 && _hoverRow < _rows.Count) Invalidate(ToClient(CardRect(_hoverRow)));
+            if (_hoverRow >= 0 && _hoverRow < _rows.Count) Invalidate(CardRect(_hoverRow));
             _hoverRow = -1; _hoverPart = Part.None; Cursor = Cursors.Default; UpdateTooltip(-1, Part.None);
+            if (_thumbHover && !_thumbDrag) { _thumbHover = false; Invalidate(TrackRect); }
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
@@ -263,11 +350,22 @@ namespace Sm86.Manager.App
             base.OnMouseDown(e);
             Focus();
             (_pressRow, _pressPart) = HitTest(e.Location);
+            if (_pressPart == Part.Thumb && e.Button == MouseButtons.Left)
+            {
+                _thumbDrag = true; _dragStartY = e.Y; _dragStartScroll = _scrollY; Capture = true; Invalidate(TrackRect);
+            }
+            else if (ScrollbarVisible && e.Button == MouseButtons.Left && TrackRect.Contains(e.Location))
+            {
+                // click in the track: page towards the click
+                var thumb = ThumbRect();
+                ScrollTo(_scrollY + (e.Y < thumb.Y ? -1 : 1) * Math.Max(Pitch, ClientSize.Height - Pitch));
+            }
         }
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+            if (_thumbDrag) { _thumbDrag = false; Capture = false; Invalidate(TrackRect); RefreshHover(e.Location); return; }
             var (row, part) = HitTest(e.Location);
             bool samePlace = row >= 0 && row == _pressRow && part == _pressPart;
             _pressRow = -1; _pressPart = Part.None;
@@ -278,22 +376,15 @@ namespace Sm86.Manager.App
             switch (part)
             {
                 case Part.Check:
-                    r.Game.Selected = !r.Game.Selected; Invalidate(ToClient(CardRect(row)));
+                    r.Game.Selected = !r.Game.Selected; Invalidate(CardRect(row));
                     CheckedChanged?.Invoke(r, r.Game.Selected); break;
                 case Part.Proxy:
-                    if (!r.Busy) { var rect = ToClient(RowCells(row).Proxy); ProxyClicked?.Invoke(r, RectangleToScreen(rect)); } break;
+                    if (!r.Busy) ProxyClicked?.Invoke(r, RectangleToScreen(RowCells(row).Proxy)); break;
                 case Part.Primary:
                     if (!r.Busy) ActionRequested?.Invoke(r, r.PrimaryAction); break;
                 case Part.Uninstall:
                     if (!r.Busy && r.ShowUninstall) ActionRequested?.Invoke(r, "uninstall"); break;
             }
-        }
-
-        protected override void OnMouseWheel(MouseEventArgs e)
-        {
-            base.OnMouseWheel(e);
-            // Hover state must follow the content that scrolled under the cursor.
-            OnMouseMove(new MouseEventArgs(MouseButtons.None, 0, e.X, e.Y, 0));
         }
 
         protected override void Dispose(bool disposing)

@@ -191,20 +191,6 @@ namespace Sm86.Manager.Tests
                     Test.True(scanned.ExePath.EndsWith("Game.exe"), scanned.ExePath);
                 }
             });
-            Test.Run("settings round-trip keeps games and selections", () =>
-            {
-                using (var f = new Fixture())
-                {
-                    var store = new SettingsStore(f.P("data"));
-                    var s = new AppSettings { Theme = "dark" };
-                    s.ScanFolders.Add(f.P("x")); s.Games.Add(new GameEntry { Name = "n", ExePath = f.P("x", "n.exe"), SelectedProxy = "dxgi.dll", Selected = true });
-                    store.Save(s);
-                    var back = store.Load();
-                    Test.Equal("dark", back.Theme); Test.Equal(1, back.Games.Count); Test.Equal("dxgi.dll", back.Games[0].SelectedProxy); Test.True(back.Games[0].Selected);
-                    File.WriteAllText(store.FilePath, "{ not json");
-                    Test.Throws<IOException>(() => store.Load());
-                }
-            });
         }
     }
 }

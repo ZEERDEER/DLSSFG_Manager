@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Linq;
 using System.Threading.Tasks;
 using Sm86.Manager;
 
@@ -76,7 +77,7 @@ namespace Sm86.Manager.Tests
             public readonly string Root = Path.Combine(Path.GetTempPath(), "sm86-upd-" + Guid.NewGuid().ToString("N"));
             public readonly FakeGithub Github = new FakeGithub();
             public readonly GithubUpdater Updater;
-            public Fixture() { Directory.CreateDirectory(Root); Updater = new GithubUpdater(Path.Combine(Root, "data"), new HttpClient(Github)); }
+            public Fixture() { Directory.CreateDirectory(Root); Updater = new GithubUpdater(Path.Combine(Root, "tmp"), new HttpClient(Github)); }
             public void Dispose() { Updater.Dispose(); if (Directory.Exists(Root)) Directory.Delete(Root, true); }
         }
 
@@ -91,8 +92,9 @@ namespace Sm86.Manager.Tests
                     Test.True(rel.Files.ContainsKey("version.dll") && rel.Files.ContainsKey("alternatives/dxgi.dll"));
                     Test.True(GithubUpdater.FindRemote(rel, "dxgi.dll").RelativePath == "alternatives/dxgi.dll");
                     Test.True(GithubUpdater.FindRemote(rel, "winmm.dll") == null);
-                    var cached = f.Updater.LoadCachedRelease();
-                    Test.Equal(FakeGithub.Commit, cached.Commit); Test.True(cached.CheckedAtUtc > DateTime.UtcNow.AddMinutes(-1));
+                    var blobs = GithubUpdater.ProxyBlobs(rel);
+                    Test.Equal(2, blobs.Count);
+                    Test.Equal(FakeGithub.Tag, blobs[FakeGithub.BlobSha(f.Github.Blobs["version.dll"])]);
                 }
             });
             Test.Run("lightweight tag resolves directly", () =>
@@ -103,7 +105,7 @@ namespace Sm86.Manager.Tests
                     Test.Equal(FakeGithub.Commit, f.Updater.CheckLatestAsync(CancellationToken.None).GetAwaiter().GetResult().Commit);
                 }
             });
-            Test.Run("download verifies blob hash, caches, records known hash, second download is offline", () =>
+            Test.Run("download verifies blob hash, remembers the hash, second download in the session is free", () =>
             {
                 using (var f = new Fixture())
                 {
@@ -112,12 +114,13 @@ namespace Sm86.Manager.Tests
                     Test.Equal("dxgi.dll", payload.ProxyName); Test.Equal(FakeGithub.Tag, payload.Tag); Test.Equal(FakeGithub.Commit, payload.Commit);
                     Test.True(File.ReadAllBytes(payload.ProxyPath).Length == f.Github.Blobs["alternatives/dxgi.dll"].Length);
                     Test.Equal(FileIntegrity.Sha256(payload.ProxyPath), payload.Sha256);
-                    Test.True(File.Exists(Path.Combine(Path.GetDirectoryName(payload.ProxyPath), GithubUpdater.ThirdPartyNoticesName)));
-                    Test.True(f.Updater.KnownHashes().ContainsKey(payload.Sha256));
+                    Test.True(payload.ProxyPath.StartsWith(f.Updater.TempDirectory), payload.ProxyPath);
+                    Test.Equal(FakeGithub.Tag, f.Updater.KnownHashes[payload.Sha256]);
                     int before = f.Github.Requests;
                     var again = f.Updater.DownloadAsync(rel, "dxgi.dll", CancellationToken.None).GetAwaiter().GetResult();
                     Test.Equal(before, f.Github.Requests); Test.Equal(payload.ProxyPath, again.ProxyPath);
-                    Test.True(f.Updater.LoadCachedPayload(rel, "dxgi.dll") != null); Test.True(f.Updater.LoadCachedPayload(rel, "version.dll") == null);
+                    f.Updater.Cleanup();
+                    Test.True(!Directory.Exists(f.Updater.TempDirectory));
                 }
             });
             Test.Run("corrupted download is rejected and leaves no file", () =>
@@ -128,19 +131,16 @@ namespace Sm86.Manager.Tests
                     var bad = (byte[])f.Github.Blobs["version.dll"].Clone(); bad[bad.Length - 1] ^= 0xFF; f.Github.Served["version.dll"] = bad;
                     var ex = Test.Throws<IOException>(() => f.Updater.DownloadAsync(rel, "version.dll", CancellationToken.None).GetAwaiter().GetResult());
                     Test.True(ex.Message.Contains("校验失败"), ex.Message);
-                    Test.True(!File.Exists(Path.Combine(f.Updater.CacheDirectory, FakeGithub.Tag + "-" + FakeGithub.Commit.Substring(0, 12), "version.dll")));
-                    Test.True(f.Updater.LoadCachedPayload(rel, "version.dll") == null);
+                    Test.True(!Directory.Exists(f.Updater.TempDirectory) || !Directory.EnumerateFiles(f.Updater.TempDirectory, "version.dll", SearchOption.AllDirectories).Any());
                 }
             });
-            Test.Run("rate limit yields a clear message and keeps cached release", () =>
+            Test.Run("rate limit yields a clear message", () =>
             {
                 using (var f = new Fixture())
                 {
-                    f.Updater.CheckLatestAsync(CancellationToken.None).GetAwaiter().GetResult();
                     f.Github.RateLimited = true;
                     var ex = Test.Throws<IOException>(() => f.Updater.CheckLatestAsync(CancellationToken.None).GetAwaiter().GetResult());
                     Test.True(ex.Message.Contains("请求次数"), ex.Message);
-                    Test.True(f.Updater.LoadCachedRelease() != null);
                 }
             });
             Test.Run("unsupported proxy and missing proxy in release are refused", () =>
@@ -158,46 +158,24 @@ namespace Sm86.Manager.Tests
                 try { File.WriteAllText(tmp, "hello\n"); Test.Equal("ce013625030ba8dba906f756967f9e9ca394464a", FileIntegrity.GitBlobSha1(tmp)); }
                 finally { File.Delete(tmp); }
             });
-            Test.Run("local package opens root or alternatives proxy and validates", () =>
+            Test.Run("steam store client caches in memory and backs off on 429", () =>
             {
-                using (var f = new Fixture())
+                var handler = new FakeStore();
+                using (var store = new SteamStoreClient(new HttpClient(handler)) { RequestGap = TimeSpan.Zero })
                 {
-                    var dir = Path.Combine(f.Root, "local 补丁"); Directory.CreateDirectory(Path.Combine(dir, "alternatives"));
-                    File.WriteAllBytes(Path.Combine(dir, "version.dll"), f.Github.Blobs["version.dll"]);
-                    File.WriteAllBytes(Path.Combine(dir, "alternatives", "dxgi.dll"), f.Github.Blobs["alternatives/dxgi.dll"]);
-                    File.WriteAllText(Path.Combine(dir, "dlssg_sm86.ini"), "[General]\nEnabled=1\n");
-                    var p = LocalPackage.Open(dir, "dxgi.dll");
-                    Test.True(p.ProxyPath.EndsWith("dxgi.dll")); Test.Equal("本地补丁", p.Tag);
-                    var known = new Dictionary<string, string> { { FileIntegrity.Sha256(Path.Combine(dir, "version.dll")), "0.3.0 (0123456)" } };
-                    Test.Equal("0.3.0 (0123456)", LocalPackage.Open(dir, "version.dll", known).Tag);
-                    Test.Throws<FileNotFoundException>(() => LocalPackage.Open(dir, "winmm.dll"));
-                    File.WriteAllText(Path.Combine(dir, "winmm.dll"), "not a dll but long enough .................................................................................................................................................................................................................................");
-                    Test.Throws<InvalidDataException>(() => LocalPackage.Open(dir, "winmm.dll"));
-                }
-            });
-            Test.Run("steam store client caches hits and misses and backs off on 429", () =>
-            {
-                using (var f = new Fixture())
-                {
-                    var handler = new FakeStore();
-                    using (var store = new SteamStoreClient(Path.Combine(f.Root, "data"), new HttpClient(handler)) { RequestGap = TimeSpan.Zero })
-                    {
-                        var cp = store.GetAsync("1091500", CancellationToken.None).GetAwaiter().GetResult();
-                        Test.Equal("赛博朋克 2077", cp.Name); Test.True(cp.Found);
-                        Test.Equal(1, handler.Requests);
-                        Test.Equal("赛博朋克 2077", store.GetAsync("1091500", CancellationToken.None).GetAwaiter().GetResult().Name);
-                        Test.Equal(1, handler.Requests); // served from cache
-                        var miss = store.GetAsync("999", CancellationToken.None).GetAwaiter().GetResult();
-                        Test.True(miss != null && !miss.Found);
-                        Test.True(store.Peek("999") != null && !store.Peek("999").Found);
-                        handler.RateLimited = true;
-                        Test.True(store.GetAsync("3681010", CancellationToken.None).GetAwaiter().GetResult() == null);
-                        handler.RateLimited = false; int before = handler.Requests;
-                        Test.True(store.GetAsync("3681010", CancellationToken.None).GetAwaiter().GetResult() == null); // backing off, no request
-                        Test.Equal(before, handler.Requests);
-                    }
-                    using (var store2 = new SteamStoreClient(Path.Combine(f.Root, "data"), new HttpClient(handler)))
-                        Test.Equal("赛博朋克 2077", store2.Peek("1091500").Name); // persisted on disk
+                    var cp = store.GetAsync("1091500", CancellationToken.None).GetAwaiter().GetResult();
+                    Test.Equal("赛博朋克 2077", cp.Name); Test.True(cp.Found);
+                    Test.Equal(1, handler.Requests);
+                    Test.Equal("赛博朋克 2077", store.GetAsync("1091500", CancellationToken.None).GetAwaiter().GetResult().Name);
+                    Test.Equal(1, handler.Requests); // served from memory
+                    var miss = store.GetAsync("999", CancellationToken.None).GetAwaiter().GetResult();
+                    Test.True(miss != null && !miss.Found);
+                    Test.True(store.Peek("999") != null && !store.Peek("999").Found);
+                    handler.RateLimited = true;
+                    Test.True(store.GetAsync("3681010", CancellationToken.None).GetAwaiter().GetResult() == null);
+                    handler.RateLimited = false; int before = handler.Requests;
+                    Test.True(store.GetAsync("3681010", CancellationToken.None).GetAwaiter().GetResult() == null); // backing off, no request
+                    Test.Equal(before, handler.Requests);
                 }
             });
         }

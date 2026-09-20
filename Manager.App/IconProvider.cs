@@ -9,38 +9,28 @@ using System.Runtime.InteropServices;
 
 namespace Sm86.Manager.App
 {
-    /// <summary>Offline game icons: Steam's local library cache first, then the icon embedded in the game EXE.</summary>
+    /// <summary>Offline game icons: the icon embedded in the game EXE first, then Steam's local library cache. Memory only.</summary>
     public sealed class IconProvider : IDisposable
     {
         private readonly Dictionary<string, Bitmap> _memory = new Dictionary<string, Bitmap>(StringComparer.OrdinalIgnoreCase);
         private readonly object _lock = new object();
         private readonly List<string> _steamRoots;
-        private readonly string _diskCache;
         public int Size { get; }
 
-        public IconProvider(string dataDirectory, int size)
+        public IconProvider(int size)
         {
             Size = size;
-            _diskCache = Path.Combine(dataDirectory, "icons");
-            Directory.CreateDirectory(_diskCache);
             try { _steamRoots = GameScanner.SteamInstallRoots().Where(Directory.Exists).ToList(); }
             catch (Exception) { _steamRoots = new List<string>(); }
         }
 
-        /// <summary>Returns a cached bitmap sized Size×Size, or null when nothing usable exists. Safe to call from a worker thread.</summary>
+        /// <summary>Returns a bitmap sized Size×Size (cached in memory for the session), or null when nothing usable exists. Safe on a worker thread.</summary>
         public Bitmap Get(GameEntry game)
         {
             var key = PathUtil.DirectoryKey(game.ExePath) + "|" + Path.GetFileName(game.ExePath).ToLowerInvariant();
             lock (_lock) { if (_memory.TryGetValue(key, out var cached)) return cached; }
-            Bitmap bmp = null;
-            var diskFile = Path.Combine(_diskCache, Hash(key) + "-" + Size + ".png");
-            try { if (File.Exists(diskFile)) using (var img = Image.FromFile(diskFile)) bmp = new Bitmap(img); } catch (Exception) { bmp = null; }
-            if (bmp == null)
-            {
-                // The EXE usually carries a 256 px icon; Steam's cached icon is only 32 px, so it is the fallback.
-                bmp = FromExecutable(game.ExePath) ?? FromSteamCache(game.SteamAppId);
-                if (bmp != null) { try { bmp.Save(diskFile, ImageFormat.Png); } catch (Exception) { } }
-            }
+            // The EXE usually carries a 256 px icon; Steam's cached icon is only 32 px, so it is the fallback.
+            var bmp = FromExecutable(game.ExePath) ?? FromSteamCache(game.SteamAppId);
             lock (_lock) { _memory[key] = bmp; }
             return bmp;
         }
@@ -126,12 +116,6 @@ namespace Sm86.Manager.App
             path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
             path.CloseFigure();
             return path;
-        }
-
-        private static string Hash(string s)
-        {
-            using (var sha = System.Security.Cryptography.SHA1.Create())
-                return BitConverter.ToString(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(s))).Replace("-", "").Substring(0, 16).ToLowerInvariant();
         }
 
         // SHDefExtractIcon gives us a properly sized icon instead of the 32 px associated icon.

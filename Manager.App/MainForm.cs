@@ -16,21 +16,20 @@ namespace Sm86.Manager.App
         public const string UpstreamUrl = "https://github.com/" + GithubUpdater.Owner + "/" + GithubUpdater.Repo;
         public const string ClientUrl = "https://github.com/ZEERDEER/DLSSFG_Manager";
 
-        private readonly string _dataDir;
-        private readonly SettingsStore _store;
-        private readonly InstallerService _installer;
-        private readonly GithubUpdater _updater;
-        private readonly SteamStoreClient _steam;
+        private readonly InstallerService _installer = new InstallerService();
+        private readonly GithubUpdater _updater = new GithubUpdater(Program.TempDirectory);
+        private readonly SteamStoreClient _steam = new SteamStoreClient();
         private readonly IconProvider _icons;
         private readonly GameScanner _scanner = new GameScanner();
-        private readonly AppSettings _settings;
+        private readonly List<GameEntry> _games = new List<GameEntry>();
+        private readonly List<string> _scanFolders = new List<string>();
         private ReleaseInfo _release;
         private CancellationTokenSource _scanCts, _namesCts;
-        private bool _busy;
+        private bool _busy, _scanning;
 
         // header
         private readonly Label _title = new Label(), _subtitle = new Label();
-        private readonly FlatButton _btnScan = new FlatButton(), _btnAdd = new FlatButton(), _btnCheck = new FlatButton(), _btnLog = new FlatButton(), _btnMore = new FlatButton(), _btnCancel = new FlatButton();
+        private readonly FlatButton _btnScan = new FlatButton(), _btnAdd = new FlatButton(), _btnCheck = new FlatButton(), _btnLog = new FlatButton(), _btnMore = new FlatButton();
         private readonly FlatButton _btnMin = new FlatButton(), _btnMax = new FlatButton(), _btnClose = new FlatButton();
         private readonly ProgressLine _progress = new ProgressLine();
         private readonly System.Windows.Forms.Timer _statusTimer = new System.Windows.Forms.Timer { Interval = 6000 };
@@ -46,16 +45,8 @@ namespace Sm86.Manager.App
 
         private readonly Dictionary<GameEntry, InstalledState> _states = new Dictionary<GameEntry, InstalledState>();
 
-        public MainForm(string dataDir, AppSettings settings)
+        public MainForm()
         {
-            _dataDir = dataDir; _settings = settings;
-            _store = new SettingsStore(dataDir);
-            _installer = new InstallerService(dataDir);
-            _updater = new GithubUpdater(dataDir);
-            _steam = new SteamStoreClient(dataDir);
-            foreach (var kv in _updater.KnownHashes()) _installer.KnownHashes[kv.Key] = kv.Value;
-            _release = _updater.LoadCachedRelease();
-
             Text = "DLSSFG Manager";
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point);
@@ -65,12 +56,12 @@ namespace Sm86.Manager.App
             DragEnter += (s, e) => { if (e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; };
             DragDrop += OnDropped;
             Icon = SystemIcons.Application;
-            _icons = new IconProvider(dataDir, S(40));
+            _icons = new IconProvider(S(40));
             _statusTimer.Tick += (s, e) => { _statusTimer.Stop(); if (!_busy) UpdateSubtitle(); };
 
             BuildLayout();
             Load += OnLoaded;
-            FormClosing += (s, e) => { _scanCts?.Cancel(); _namesCts?.Cancel(); SaveSettings(); };
+            FormClosing += (s, e) => { _scanCts?.Cancel(); _namesCts?.Cancel(); };
         }
 
         private int S(int v) => Dpi.S(this, v);
@@ -157,14 +148,16 @@ namespace Sm86.Manager.App
 
         // ------------------------------------------------------------------ layout
 
+        private const int SideMargin = 24;
+
         private void BuildLayout()
         {
             Padding = new Padding(0, FrameThickness() - 1, 0, 0);
 
             // ---- header
             var header = new Panel { Dock = DockStyle.Top, Height = S(96), BackColor = Palette.Window };
-            _title.Text = "DLSSFG Manager"; _title.Font = new Font(Font.FontFamily, 16f, FontStyle.Bold); _title.AutoSize = true; _title.Location = new Point(S(24), S(22)); _title.ForeColor = Palette.Text; _title.BackColor = Color.Transparent;
-            _subtitle.AutoSize = false; _subtitle.Location = new Point(S(26), S(58)); _subtitle.Size = new Size(S(560), S(22)); _subtitle.ForeColor = Palette.Muted; _subtitle.BackColor = Color.Transparent; _subtitle.AutoEllipsis = true; _subtitle.TextAlign = ContentAlignment.MiddleLeft;
+            _title.Text = "DLSSFG Manager"; _title.Font = new Font(Font.FontFamily, 16f, FontStyle.Bold); _title.AutoSize = true; _title.Location = new Point(S(SideMargin), S(22)); _title.ForeColor = Palette.Text; _title.BackColor = Color.Transparent;
+            _subtitle.AutoSize = false; _subtitle.Location = new Point(S(SideMargin + 2), S(58)); _subtitle.Size = new Size(S(560), S(22)); _subtitle.ForeColor = Palette.Muted; _subtitle.BackColor = Color.Transparent; _subtitle.AutoEllipsis = true; _subtitle.TextAlign = ContentAlignment.MiddleLeft;
 
             var caption = new FlowLayoutPanel { Dock = DockStyle.Top, Height = S(32), FlowDirection = FlowDirection.RightToLeft, WrapContents = false, BackColor = Color.Transparent, Padding = new Padding(0), Margin = new Padding(0) };
             var glyphFont = new Font("Segoe MDL2 Assets", 9f);
@@ -178,17 +171,16 @@ namespace Sm86.Manager.App
             _btnMax.Click += (s, e) => ToggleMaximize();
             _btnClose.Click += (s, e) => Close();
 
+            // Right-aligned toolbar: its right edge lines up with the cards below (same side margin).
             var toolbar = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Padding = new Padding(0), Margin = new Padding(0) };
-            foreach (var (b, text, width, tip) in new[] { (_btnCancel, "取消扫描", 96, ""), (_btnScan, "扫描游戏", 96, "读取 Steam 库和自定义目录"), (_btnAdd, "添加 ▾", 84, "添加目录或 EXE"), (_btnCheck, "检查更新", 96, "查询上游最新 Release"), (_btnLog, "\uE7C3", 40, "活动日志"), (_btnMore, "\uE712", 40, "更多") })
+            foreach (var (b, text, width, tip) in new[] { (_btnScan, "扫描游戏", 96, "读取 Steam 库和已添加的目录"), (_btnAdd, "添加游戏", 96, "选择游戏目录或 EXE；也可以直接拖进窗口"), (_btnCheck, "检查更新", 96, "查询上游最新 Release"), (_btnLog, "\uE7C3", 40, "活动日志"), (_btnMore, "\uE712", 40, "更多") })
             {
                 b.Text = text; b.Kind = width == 40 ? FlatButton.Role.Subtle : FlatButton.Role.Normal; b.Size = new Size(S(width), S(34)); b.Margin = new Padding(S(6), 0, 0, 0);
                 if (width == 40) b.Font = new Font("Segoe MDL2 Assets", 10f);
-                if (tip.Length > 0) new ToolTip().SetToolTip(b, tip);
+                new ToolTip().SetToolTip(b, tip);
                 toolbar.Controls.Add(b);
             }
-            _btnCancel.Visible = false;
-            _btnScan.Click += async (s, e) => await ScanAsync(null);
-            _btnCancel.Click += (s, e) => _scanCts?.Cancel();
+            _btnScan.Click += async (s, e) => { if (_scanning) _scanCts?.Cancel(); else await ScanAsync(null); };
             _btnAdd.Click += (s, e) => ShowAddMenu();
             _btnCheck.Click += async (s, e) => await CheckUpdatesAsync(true);
             _btnLog.Click += (s, e) => ToggleLog();
@@ -197,14 +189,14 @@ namespace Sm86.Manager.App
             header.Controls.Add(_title); header.Controls.Add(_subtitle); header.Controls.Add(toolbar); header.Controls.Add(caption); header.Controls.Add(_progress);
             void PlaceToolbar()
             {
-                toolbar.Location = new Point(header.ClientSize.Width - toolbar.Width - S(16), S(46));
+                toolbar.Location = new Point(header.ClientSize.Width - toolbar.Width - S(SideMargin), S(46));
                 _subtitle.Width = Math.Max(S(200), toolbar.Left - _subtitle.Left - S(16));
             }
             header.Resize += (s, e) => PlaceToolbar(); toolbar.SizeChanged += (s, e) => PlaceToolbar();
             foreach (var c in new Control[] { header, caption, _title, _subtitle, toolbar }) MakeDraggable(c);
 
             // ---- footer
-            var footer = new Panel { Dock = DockStyle.Bottom, Height = S(64), Padding = new Padding(S(24), S(14), S(24), S(12)), BackColor = Palette.Window };
+            var footer = new Panel { Dock = DockStyle.Bottom, Height = S(64), Padding = new Padding(S(SideMargin), S(14), S(SideMargin), S(12)), BackColor = Palette.Window };
             var left = new FlowLayoutPanel { Dock = DockStyle.Left, AutoSize = true, WrapContents = false, BackColor = Color.Transparent };
             _selectionInfo.AutoSize = true; _selectionInfo.Margin = new Padding(0, S(9), S(12), 0); _selectionInfo.ForeColor = Palette.Muted; _selectionInfo.BackColor = Color.Transparent;
             left.Controls.Add(_selectionInfo);
@@ -231,13 +223,13 @@ namespace Sm86.Manager.App
             footer.Controls.Add(left); footer.Controls.Add(credits);
 
             // ---- center: the list plus overlays
-            _center.Dock = DockStyle.Fill; _center.BackColor = Palette.Window; _center.Padding = new Padding(S(24), S(4), S(24), S(4));
+            _center.Dock = DockStyle.Fill; _center.BackColor = Palette.Window; _center.Padding = new Padding(S(SideMargin), S(4), S(SideMargin), S(4));
             _list.Dock = DockStyle.Fill;
-            _list.CheckedChanged += (row, v) => { UpdateSelectionSummary(); SaveSettings(); };
+            _list.CheckedChanged += (row, v) => UpdateSelectionSummary();
             _list.ProxyClicked += (row, anchor) => ShowProxyMenu(row, anchor);
             _list.ActionRequested += async (row, op) => await RunBatchAsync(op, new[] { row.Game });
             _list.ContextMenuRequested += (row, at) => ShowRowMenu(row, at);
-            _empty.Text = "还没有游戏。\n点击右上角「扫描游戏」自动读取 Steam 库，或把游戏 EXE / 文件夹拖到这里。"; _empty.AutoSize = false; _empty.Dock = DockStyle.Fill; _empty.TextAlign = ContentAlignment.MiddleCenter; _empty.ForeColor = Palette.Muted; _empty.Font = new Font(Font.FontFamily, 11f); _empty.BackColor = Palette.Window; _empty.Visible = false;
+            _empty.Text = "还没有游戏。\n点击右上角「扫描游戏」读取 Steam 库，或用「添加游戏」选择目录 / EXE，也可以直接拖进来。"; _empty.AutoSize = false; _empty.Dock = DockStyle.Fill; _empty.TextAlign = ContentAlignment.MiddleCenter; _empty.ForeColor = Palette.Muted; _empty.Font = new Font(Font.FontFamily, 11f); _empty.BackColor = Palette.Window; _empty.Visible = false;
             _center.Controls.Add(_empty); _center.Controls.Add(_list);
             _empty.BringToFront();
 
@@ -288,10 +280,9 @@ namespace Sm86.Manager.App
         {
             var parts = new List<string>
             {
-                _release != null ? "上游 " + _release.Tag + "，检查于 " + _release.CheckedAtUtc.ToLocalTime().ToString("MM-dd HH:mm") : "尚未检查上游版本",
-                _settings.Games.Count + " 个游戏",
+                _release != null ? "上游最新 " + _release.Tag : "尚未获取上游版本",
+                _games.Count + " 个游戏",
             };
-            if (!string.IsNullOrEmpty(_settings.LocalPackageDirectory)) parts.Add("本地补丁：" + _settings.LocalPackageDirectory);
             _subtitle.Text = string.Join("  ·  ", parts); _subtitle.ForeColor = Palette.Muted;
         }
 
@@ -310,71 +301,62 @@ namespace Sm86.Manager.App
             _progress.Visible = visible;
         }
 
-        // ------------------------------------------------------------------ startup
+        // ------------------------------------------------------------------ startup: nothing is persisted, so scan and check every time
 
         private async void OnLoaded(object sender, EventArgs e)
         {
-            Log("数据目录：" + _dataDir + (Palette.Dark ? "  · 深色模式" : "  · 浅色模式"));
-            bool changed = false;
-            foreach (var g in _settings.Games)
-            {
-                var fixedExe = PathUtil.ActualCase(g.ExePath); var fixedRoot = PathUtil.ActualCase(g.InstallRoot);
-                if (fixedExe != g.ExePath || fixedRoot != g.InstallRoot) { g.ExePath = fixedExe; g.InstallRoot = fixedRoot; changed = true; }
-            }
-            if (changed) SaveSettings();
-            try { foreach (var msg in await Task.Run(() => _installer.RecoverPending())) Log(msg); }
-            catch (Exception ex) { Log("恢复未完成操作失败：" + ex.Message); }
-            RebuildRows();
-            _ = FetchNamesAsync();
+            Log("临时目录：" + Program.TempDirectory + "（退出时清理）" + (Palette.Dark ? "  · 深色模式" : "  · 浅色模式"));
+            await ScanAsync(null);
+            if (_release == null) await CheckUpdatesAsync(false);
         }
 
         // ------------------------------------------------------------------ rows
 
-        private IEnumerable<GameEntry> Checked() => _settings.Games.Where(g => g.Selected).ToList();
+        private IEnumerable<GameEntry> Checked() => _games.Where(g => g.Selected).ToList();
 
-        private void RebuildRows()
+        private async Task RebuildRowsAsync()
         {
-            var rows = new List<GameListView.Row>();
-            foreach (var g in _settings.Games)
-            {
-                var row = new GameListView.Row { Game = g };
-                Bind(row);
-                rows.Add(row);
-            }
+            var rows = _games.Select(g => new GameListView.Row { Game = g }).ToList();
+            await Task.Run(() => { foreach (var r in rows) Bind(r, refresh: false); });
             _list.SetRows(rows);
             foreach (var row in rows) LoadIconAsync(row);
-            _empty.Visible = _settings.Games.Count == 0;
-            UpdateSelectionSummary();
+            _empty.Visible = _games.Count == 0;
+            UpdateSelectionSummary(); UpdateSubtitle();
         }
 
-        private void Bind(GameListView.Row row)
+        /// <summary>Compute a row's visual state from the game folder. Safe on a worker thread when refresh is false.</summary>
+        private void Bind(GameListView.Row row, bool refresh = true)
         {
             var g = row.Game;
             InstalledState st = null;
-            try { st = _installer.Inspect(g); _states[g] = st; g.Status = st.Status; g.InstalledVersion = st.Version; }
-            catch (Exception ex) { g.Status = "无法检查：" + ex.Message; _states.Remove(g); }
+            try { st = _installer.Inspect(g); lock (_states) _states[g] = st; g.Status = st.Status; g.InstalledVersion = st.Version; }
+            catch (Exception ex) { g.Status = "无法检查：" + ex.Message; lock (_states) _states.Remove(g); }
             row.State = st;
             row.Ambiguous = g.CandidateExes.Count > 1 && g.LocatedBy != "用户选择";
             row.Tooltip = "推荐 " + g.RecommendedProxy + "：" + g.RecommendationReason + "\n点击更换代理 DLL；每个游戏只启用一个。";
             bool installed = st != null && st.IsInstalled;
             row.Version = installed ? st.Version : "—";
             if (st == null) { row.StatusText = g.Status; row.StatusDot = Palette.Danger; }
-            else if (st.IsModified) { row.StatusText = "已被外部修改"; row.StatusDot = Palette.Danger; }
             else if (st.IsAmbiguous) { row.StatusText = "多个代理 DLL"; row.StatusDot = Palette.Warning; }
             else if (!installed) { row.StatusText = "未安装"; row.StatusDot = Palette.Muted; }
-            else if (_release != null && st.Version != "未知版本" && st.Version != _release.Tag) { row.StatusText = "可更新 → " + _release.Tag; row.StatusDot = Palette.Warning; }
-            else if (st.Version == "未知版本") { row.StatusText = st.IsManaged ? "已安装" : "旧插件 · 未知版本"; row.StatusDot = Palette.Warning; }
-            else { row.StatusText = st.IsManaged ? "已安装" : "已安装 · 未纳管"; row.StatusDot = Palette.Success; }
+            else if (st.Version == "未知版本") { row.StatusText = "已安装 · 未知版本"; row.StatusDot = Palette.Warning; }
+            else if (_release != null && st.Version != _release.Tag) { row.StatusText = "可更新 → " + _release.Tag; row.StatusDot = Palette.Warning; }
+            else { row.StatusText = "已安装"; row.StatusDot = Palette.Success; }
 
             if (!installed) { row.PrimaryAction = "install"; row.PrimaryText = "安装"; row.PrimaryIsAccent = true; }
             else if (!st.ProxyName.Equals(g.SelectedProxy, StringComparison.OrdinalIgnoreCase)) { row.PrimaryAction = "install"; row.PrimaryText = "切换"; row.PrimaryIsAccent = true; }
-            else if (_release != null && !st.IsModified && st.Version != _release.Tag) { row.PrimaryAction = "update"; row.PrimaryText = "更新"; row.PrimaryIsAccent = true; }
+            else if (_release != null && st.Version != _release.Tag) { row.PrimaryAction = "update"; row.PrimaryText = "更新"; row.PrimaryIsAccent = true; }
             else { row.PrimaryAction = "install"; row.PrimaryText = "重装"; row.PrimaryIsAccent = false; }
-            row.ShowUninstall = installed;
-            _list.RefreshRow(row);
+            row.ShowUninstall = installed || (st != null && st.IsAmbiguous);
+            if (refresh) _list.RefreshRow(row);
         }
 
-        private void BindAll() { foreach (var r in _list.Rows) Bind(r); _list.RefreshAll(); UpdateSelectionSummary(); }
+        private async Task BindAllAsync()
+        {
+            var rows = _list.Rows.ToList();
+            await Task.Run(() => { foreach (var r in rows) Bind(r, refresh: false); });
+            _list.RefreshAll(); UpdateSelectionSummary();
+        }
 
         private void LoadIconAsync(GameListView.Row row)
         {
@@ -388,62 +370,55 @@ namespace Sm86.Manager.App
 
         private void UpdateSelectionSummary()
         {
-            int n = _settings.Games.Count(g => g.Selected);
+            int n = _games.Count(g => g.Selected);
             _selectionInfo.Text = n > 0 ? "已勾选 " + n + " 个" : "勾选游戏后可批量操作";
             _btnInstallSel.Enabled = n > 0 && !_busy; _btnUninstallSel.Enabled = n > 0 && !_busy;
-            _btnUpdateSel.Enabled = n > 0 && !_busy && _settings.Games.Any(g => g.Selected && _states.TryGetValue(g, out var st) && st.IsInstalled);
+            bool anyInstalled; lock (_states) anyInstalled = _games.Any(g => g.Selected && _states.TryGetValue(g, out var st) && st.IsInstalled);
+            _btnUpdateSel.Enabled = n > 0 && !_busy && anyInstalled;
         }
 
-        private void MergeGames(IEnumerable<GameEntry> found, string source)
+        private async Task MergeGamesAsync(IEnumerable<GameEntry> found, string source)
         {
             int added = 0, updated = 0;
             foreach (var g in found)
             {
                 var key = PathUtil.DirectoryKey(g.ExePath);
-                var existing = _settings.Games.FirstOrDefault(x => PathUtil.DirectoryKey(x.ExePath) == key);
-                if (existing == null) { g.Selected = false; _settings.Games.Add(g); added++; }
+                var existing = _games.FirstOrDefault(x => PathUtil.DirectoryKey(x.ExePath) == key);
+                if (existing == null) { g.Selected = false; _games.Add(g); added++; }
                 else
                 {
-                    ProxyRecommender.Apply(existing, existing.SelectedProxy);
                     if (string.IsNullOrEmpty(existing.SteamAppId)) existing.SteamAppId = g.SteamAppId;
-                    if (KnownGames.Match(g) != null && !string.IsNullOrEmpty(g.Name)) existing.Name = g.Name;
                     if (existing.LocatedBy != "用户选择") { existing.ExePath = g.ExePath; existing.CandidateExes = g.CandidateExes; existing.LocatedBy = g.LocatedBy; }
-                    existing.InstallRoot = g.InstallRoot;
                     updated++;
                 }
             }
-            _settings.Games.Sort((a, b) => string.Compare(a.Title, b.Title, StringComparison.CurrentCultureIgnoreCase));
+            _games.Sort((a, b) => string.Compare(a.Title, b.Title, StringComparison.CurrentCultureIgnoreCase));
             Log(source + "：新增 " + added + " 个，已存在 " + updated + " 个。");
-            SaveSettings();
-            RebuildRows(); UpdateSubtitle();
+            await RebuildRowsAsync();
             _ = FetchNamesAsync();
         }
 
-        private void SaveSettings() { try { _store.Save(_settings); } catch (Exception ex) { Log("保存设置失败：" + ex.Message); } }
-
-        // ------------------------------------------------------------------ names (Steam store, cached)
+        // ------------------------------------------------------------------ names (Steam store, in-memory for the session)
 
         private async Task FetchNamesAsync()
         {
             _namesCts?.Cancel();
             var cts = _namesCts = new CancellationTokenSource();
-            bool changed = false;
             try
             {
-                foreach (var g in _settings.Games.Where(g => !string.IsNullOrEmpty(g.SteamAppId) && string.IsNullOrEmpty(g.DisplayName)).ToList())
+                foreach (var g in _games.Where(g => !string.IsNullOrEmpty(g.SteamAppId) && string.IsNullOrEmpty(g.DisplayName)).ToList())
                 {
                     if (cts.IsCancellationRequested) return;
                     var info = _steam.Peek(g.SteamAppId) ?? await _steam.GetAsync(g.SteamAppId, cts.Token);
                     if (info != null && info.Found && info.Name != g.Title)
                     {
-                        g.DisplayName = info.Name; changed = true;
+                        g.DisplayName = info.Name;
                         var row = _list.RowFor(g); if (row != null) _list.RefreshRow(row);
                     }
                 }
             }
             catch (OperationCanceledException) { }
             catch (Exception ex) { Log("获取 Steam 名称失败：" + ex.Message); }
-            if (changed && !cts.IsCancellationRequested) SaveSettings();
         }
 
         // ------------------------------------------------------------------ menus
@@ -466,8 +441,9 @@ namespace Sm86.Manager.App
                 item.Click += (s, e) =>
                 {
                     if (g.SelectedProxy.Equals(proxy, StringComparison.OrdinalIgnoreCase)) return;
-                    g.SelectedProxy = proxy; SaveSettings(); Bind(row);
-                    if (_states.TryGetValue(g, out var st) && st.IsInstalled && !st.ProxyName.Equals(proxy, StringComparison.OrdinalIgnoreCase))
+                    g.SelectedProxy = proxy; Bind(row);
+                    InstalledState st; lock (_states) _states.TryGetValue(g, out st);
+                    if (st != null && st.IsInstalled && !st.ProxyName.Equals(proxy, StringComparison.OrdinalIgnoreCase))
                         SetStatus("「" + g.Title + "」当前部署的是 " + st.ProxyName + "，点击「切换」后生效。", transient: true);
                 };
                 menu.Items.Add(item);
@@ -480,49 +456,23 @@ namespace Sm86.Manager.App
         private void ShowAddMenu()
         {
             var menu = NewMenu();
-            menu.Items.Add("添加扫描目录…", null, async (s, e) => await AddFolderAsync());
+            menu.Items.Add("选择游戏目录…", null, async (s, e) => await AddFolderAsync());
             menu.Items.Add("选择游戏 EXE…", null, (s, e) => AddExeDialog());
-            if (_settings.ScanFolders.Count > 0)
-            {
-                menu.Items.Add(new ToolStripSeparator());
-                foreach (var f in _settings.ScanFolders.ToList())
-                {
-                    var item = new ToolStripMenuItem("移除目录  " + f);
-                    item.Click += (s, e) => { _settings.ScanFolders.Remove(f); SaveSettings(); Log("已移除扫描目录：" + f); };
-                    menu.Items.Add(item);
-                }
-            }
             menu.Show(_btnAdd, new Point(0, _btnAdd.Height + S(4)));
         }
 
         private void ShowMoreMenu()
         {
             var menu = NewMenu();
-            menu.Items.Add("导入本地补丁目录…", null, (s, e) => ImportLocal());
-            if (!string.IsNullOrEmpty(_settings.LocalPackageDirectory))
-                menu.Items.Add("停用本地补丁（改用上游）", null, (s, e) => { _settings.LocalPackageDirectory = ""; SaveSettings(); UpdateSubtitle(); Log("已停用本地补丁。"); });
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("全部勾选", null, (s, e) => { foreach (var g in _settings.Games) g.Selected = true; _list.RefreshAll(); UpdateSelectionSummary(); SaveSettings(); });
-            menu.Items.Add("全部取消勾选", null, (s, e) => { foreach (var g in _settings.Games) g.Selected = false; _list.RefreshAll(); UpdateSelectionSummary(); SaveSettings(); });
-            menu.Items.Add("刷新状态", null, (s, e) => BindAll());
-            menu.Items.Add(new ToolStripSeparator());
-            var theme = new ToolStripMenuItem("主题");
-            foreach (var (label, value) in new[] { ("跟随系统", "system"), ("浅色", "light"), ("深色", "dark") })
-            {
-                var item = new ToolStripMenuItem(label) { Checked = _settings.Theme == value };
-                item.Click += (s, e) => ChangeTheme(value);
-                theme.DropDownItems.Add(item);
-            }
-            theme.DropDown.Renderer = menu.Renderer; theme.DropDown.BackColor = Palette.Card; theme.DropDown.ForeColor = Palette.Text;
-            menu.Items.Add(theme);
-            menu.Items.Add("打开数据目录", null, (s, e) => OpenPath(_dataDir));
-            menu.Items.Add("打开备份目录", null, (s, e) => OpenPath(_installer.BackupsDirectory));
+            menu.Items.Add("全部勾选", null, (s, e) => { foreach (var g in _games) g.Selected = true; _list.RefreshAll(); UpdateSelectionSummary(); });
+            menu.Items.Add("全部取消勾选", null, (s, e) => { foreach (var g in _games) g.Selected = false; _list.RefreshAll(); UpdateSelectionSummary(); });
+            menu.Items.Add("刷新状态", null, async (s, e) => await BindAllAsync());
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("关于", null, (s, e) => MessageBox.Show(this,
                 "DLSSFG Manager " + typeof(MainForm).Assembly.GetName().Version?.ToString(3) +
                 "\n\nPowered by sdli1995 — DLSS Frame Generation for SM86 (RTX 20/30)\n" + UpstreamUrl +
                 "\n\nDesigned by zeer\n" + ClientUrl +
-                "\n\n游戏名称来自 Steam 商店（本地缓存），图标来自游戏 EXE 或 Steam 缓存。\n安装状态仅表示文件已部署；帧生成是否生效需启动游戏验证。", "关于", MessageBoxButtons.OK, MessageBoxIcon.Information));
+                "\n\n补丁文件每次从上游仓库下载并校验；本程序不保存任何设置或缓存。\n游戏名称来自 Steam 商店，图标来自游戏 EXE 或 Steam 缓存。\n安装状态仅表示文件已部署；帧生成是否生效需启动游戏验证。", "关于", MessageBoxButtons.OK, MessageBoxIcon.Information));
             menu.Show(_btnMore, new Point(_btnMore.Width - menu.Width, _btnMore.Height + S(4)));
         }
 
@@ -535,9 +485,8 @@ namespace Sm86.Manager.App
             var ini = Path.Combine(g.DirectoryPath, InstallerService.IniName);
             menu.Items.Add("打开 dlssg_sm86.ini", null, (s, e) => OpenPath(ini)).Enabled = File.Exists(ini);
             menu.Items.Add("打开日志目录", null, (s, e) => OpenLogs(g)).Enabled = File.Exists(ini);
-            menu.Items.Add("恢复最近备份…", null, async (s, e) => await RestoreAsync(row)).Enabled = _installer.ListBackups(g).Count > 0;
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("从列表移除", null, (s, e) => RemoveGame(g));
+            menu.Items.Add("从列表移除", null, async (s, e) => await RemoveGameAsync(g));
             menu.Show(at);
         }
 
@@ -546,23 +495,25 @@ namespace Sm86.Manager.App
         private async Task ScanAsync(IEnumerable<string> onlyRoots)
         {
             if (_busy) return;
-            var roots = onlyRoots?.ToList() ?? _settings.ScanFolders.ToList();
+            var roots = onlyRoots?.ToList() ?? _scanFolders.ToList();
             bool includeSteam = onlyRoots == null;
             _scanCts = new CancellationTokenSource();
-            SetBusy(true, "扫描中…"); _btnCancel.Visible = true; ShowProgress(true);
+            _scanning = true; _btnScan.Text = "取消扫描";
+            SetBusy(true, "扫描中…"); _btnScan.Enabled = true; ShowProgress(true);
             var progress = new Progress<string>(m => SetStatus(m));
             string outcome;
             try
             {
                 var result = await Task.Run(() => _scanner.Scan(roots, includeSteam, _scanCts.Token, progress));
                 foreach (var w in result.Warnings) Log("提示：" + w);
-                MergeGames(result.Games, "扫描完成");
-                int ambiguous = _settings.Games.Count(g => g.CandidateExes.Count > 1 && g.LocatedBy != "用户选择");
-                outcome = "扫描完成，共 " + _settings.Games.Count + " 个游戏。" + (ambiguous > 0 ? " 有 " + ambiguous + " 个需要确认实际 EXE（右键该行）。" : "");
+                await MergeGamesAsync(result.Games, "扫描完成");
+                int ambiguous = _games.Count(g => g.CandidateExes.Count > 1 && g.LocatedBy != "用户选择");
+                outcome = "扫描完成，共 " + _games.Count + " 个游戏。" + (ambiguous > 0 ? " 有 " + ambiguous + " 个需要确认实际 EXE（右键该行）。" : "");
             }
             catch (OperationCanceledException) { outcome = "扫描已取消。"; }
             catch (Exception ex) { Log("扫描失败：" + ex.Message); outcome = "扫描失败：" + ex.Message; }
-            _btnCancel.Visible = false; ShowProgress(false); _scanCts = null;
+            _scanning = false; _btnScan.Text = "扫描游戏"; _scanCts = null;
+            ShowProgress(false);
             SetBusy(false, outcome);
         }
 
@@ -571,7 +522,7 @@ namespace Sm86.Manager.App
             using (var dlg = new FolderBrowserDialog { Description = "选择游戏目录，或放了多个游戏的文件夹", ShowNewFolderButton = false, UseDescriptionForTitle = true })
             {
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
-                if (!_settings.ScanFolders.Contains(dlg.SelectedPath, StringComparer.OrdinalIgnoreCase)) { _settings.ScanFolders.Add(dlg.SelectedPath); SaveSettings(); }
+                if (!_scanFolders.Contains(dlg.SelectedPath, StringComparer.OrdinalIgnoreCase)) _scanFolders.Add(dlg.SelectedPath);
                 await ScanAsync(new[] { dlg.SelectedPath });
             }
         }
@@ -579,12 +530,12 @@ namespace Sm86.Manager.App
         private void AddExeDialog()
         {
             using (var dlg = new OpenFileDialog { Filter = "游戏可执行文件 (*.exe)|*.exe", Title = "选择游戏实际运行的 EXE（渲染进程）" })
-                if (dlg.ShowDialog(this) == DialogResult.OK) AddExe(dlg.FileName);
+                if (dlg.ShowDialog(this) == DialogResult.OK) _ = AddExeAsync(dlg.FileName);
         }
 
-        private void AddExe(string path)
+        private async Task AddExeAsync(string path)
         {
-            try { MergeGames(new[] { _scanner.FromExecutable(path) }, "添加 EXE"); }
+            try { await MergeGamesAsync(new[] { _scanner.FromExecutable(path) }, "添加 EXE"); }
             catch (Exception ex) { MessageBox.Show(this, ex.Message, "无法添加", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         }
 
@@ -595,7 +546,7 @@ namespace Sm86.Manager.App
             foreach (var p in paths)
             {
                 if (Directory.Exists(p)) dirs.Add(p);
-                else if (p.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) AddExe(p);
+                else if (p.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) await AddExeAsync(p);
             }
             if (dirs.Count > 0) await ScanAsync(dirs);
         }
@@ -618,40 +569,25 @@ namespace Sm86.Manager.App
                 if (dlg.ShowDialog(this) != DialogResult.OK || list.SelectedIndex < 0) return;
                 var chosen = g.CandidateExes[list.SelectedIndex];
                 var key = PathUtil.DirectoryKey(chosen);
-                if (_settings.Games.Any(x => x != g && PathUtil.DirectoryKey(x.ExePath) == key)) { MessageBox.Show(this, "列表中已有指向同一目录的游戏。", "重复", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+                if (_games.Any(x => x != g && PathUtil.DirectoryKey(x.ExePath) == key)) { MessageBox.Show(this, "列表中已有指向同一目录的游戏。", "重复", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
                 g.ExePath = PathUtil.ActualCase(chosen); g.LocatedBy = "用户选择";
                 ProxyRecommender.Apply(g, g.SelectedProxy);
-                SaveSettings(); Bind(row); LoadIconAsync(row);
+                Bind(row); LoadIconAsync(row);
             }
         }
 
-        private void RemoveGame(GameEntry g)
+        private async Task RemoveGameAsync(GameEntry g)
         {
             if (MessageBox.Show(this, "从列表移除「" + g.Title + "」？不会改动游戏目录里的任何文件。", "移除", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
-            _settings.Games.Remove(g); SaveSettings(); RebuildRows(); UpdateSubtitle();
+            _games.Remove(g); await RebuildRowsAsync();
         }
 
-        // ------------------------------------------------------------------ patch sources
-
-        private void ImportLocal()
-        {
-            using (var dlg = new FolderBrowserDialog { Description = "选择本地补丁目录（上游仓库或发布包解压目录，须包含 dlssg_sm86.ini）", ShowNewFolderButton = false, UseDescriptionForTitle = true })
-            {
-                if (dlg.ShowDialog(this) != DialogResult.OK) return;
-                try
-                {
-                    var probe = LocalPackage.Open(dlg.SelectedPath, "version.dll", _installer.KnownHashes);
-                    _settings.LocalPackageDirectory = dlg.SelectedPath; SaveSettings(); UpdateSubtitle();
-                    Log("已导入本地补丁目录：" + dlg.SelectedPath + "（version.dll 识别为：" + probe.Tag + "）。安装时将优先使用它。");
-                }
-                catch (Exception ex) { MessageBox.Show(this, ex.Message, "本地补丁无效", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
-            }
-        }
+        // ------------------------------------------------------------------ upstream
 
         private async Task<bool> CheckUpdatesAsync(bool verbose)
         {
             if (_busy) return false;
-            SetBusy(true, "正在查询 GitHub 最新 Release…"); ShowProgress(true);
+            SetBusy(true, "正在查询上游最新 Release…"); ShowProgress(true);
             bool ok = await FetchReleaseAsync(verbose);
             ShowProgress(false);
             SetBusy(false, ok ? "上游最新版本 " + _release.Tag + "。" : null);
@@ -660,52 +596,37 @@ namespace Sm86.Manager.App
 
         private async Task<bool> FetchReleaseAsync(bool verbose)
         {
-            SetStatus("正在查询 GitHub 最新 Release…");
+            SetStatus("正在查询上游最新 Release…");
             try
             {
                 _release = await _updater.CheckLatestAsync(CancellationToken.None);
-                Log("最新稳定 Release：" + _release.Tag + "，提交 " + _release.Commit.Substring(0, 7) + "。");
-                BindAll();
+                foreach (var kv in GithubUpdater.ProxyBlobs(_release)) _installer.KnownBlobs[kv.Key] = kv.Value;
+                Log("上游最新稳定 Release：" + _release.Tag + "，提交 " + _release.Commit.Substring(0, 7) + "。");
+                await BindAllAsync(); UpdateSubtitle();
                 return true;
             }
             catch (Exception ex)
             {
-                Log("检查更新失败：" + ex.Message);
-                if (_release != null) Log("将继续使用已缓存的 Release " + _release.Tag + "（检查于 " + _release.CheckedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm") + "）。");
+                Log("获取上游版本失败：" + ex.Message);
                 if (verbose) MessageBox.Show(this, ex.Message, "检查更新失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return false;
             }
         }
 
-        private async Task<PatchPayload> GetPayloadAsync(string proxy, bool preferUpstream, Dictionary<string, PatchPayload> memo)
+        private async Task<PatchPayload> GetPayloadAsync(string proxy, Dictionary<string, PatchPayload> memo)
         {
             if (memo.TryGetValue(proxy, out var cached)) return cached;
-            PatchPayload payload = null;
-            if (!preferUpstream && !string.IsNullOrEmpty(_settings.LocalPackageDirectory))
+            if (_release == null && !await FetchReleaseAsync(false)) throw new IOException("无法获取上游 Release，请检查网络后重试。");
+            var progress = new Progress<TransferProgress>(tp =>
             {
-                try { payload = LocalPackage.Open(_settings.LocalPackageDirectory, proxy, _installer.KnownHashes); Log("使用本地补丁 " + proxy + "（" + payload.Tag + "）。"); }
-                catch (Exception ex) { Log("本地补丁不可用（" + ex.Message + "），改用上游。"); }
-            }
-            if (payload == null)
-            {
-                if (_release == null || preferUpstream)
-                    if (!await FetchReleaseAsync(false) && _release == null) throw new IOException("无法获取上游 Release，也没有本地补丁；请检查网络或导入本地补丁。");
-                payload = _updater.LoadCachedPayload(_release, proxy);
-                if (payload != null) Log("使用已校验缓存 " + proxy + "（" + _release.Tag + "）。");
-                else
-                {
-                    var progress = new Progress<TransferProgress>(tp =>
-                    {
-                        int pct = tp.Total > 0 ? (int)Math.Min(100, tp.Received * 100 / Math.Max(1, tp.Total)) : 0;
-                        SetStatus(tp.Message + (tp.Total > 0 ? "  " + pct + "%" : ""));
-                        if (tp.Total > 0) ShowProgress(true, false, pct);
-                    });
-                    payload = await _updater.DownloadAsync(_release, proxy, CancellationToken.None, progress);
-                    ShowProgress(true);
-                    foreach (var kv in _updater.KnownHashes()) _installer.KnownHashes[kv.Key] = kv.Value;
-                    Log("已下载并校验 " + proxy + "（" + _release.Tag + "，SHA-256 " + payload.Sha256.Substring(0, 12) + "…）。");
-                }
-            }
+                int pct = tp.Total > 0 ? (int)Math.Min(100, tp.Received * 100 / Math.Max(1, tp.Total)) : 0;
+                SetStatus(tp.Message + (tp.Total > 0 ? "  " + pct + "%" : ""));
+                if (tp.Total > 0) ShowProgress(true, false, pct);
+            });
+            var payload = await _updater.DownloadAsync(_release, proxy, CancellationToken.None, progress);
+            ShowProgress(true);
+            foreach (var kv in _updater.KnownHashes) _installer.KnownHashes[kv.Key] = kv.Value;
+            Log("已下载并校验 " + proxy + "（" + _release.Tag + "，SHA-256 " + payload.Sha256.Substring(0, 12) + "…）。");
             memo[proxy] = payload;
             return payload;
         }
@@ -719,7 +640,7 @@ namespace Sm86.Manager.App
             if (targets.Count == 0) { SetStatus("请先勾选要操作的游戏。", transient: true); return; }
             var ambiguous = targets.Where(g => g.CandidateExes.Count > 1 && g.LocatedBy != "用户选择").ToList();
             if (ambiguous.Count > 0 && MessageBox.Show(this, "以下游戏检测到多个可执行文件，尚未确认实际渲染 EXE：\n\n" + string.Join("\n", ambiguous.Select(g => g.Title)) + "\n\n仍按当前选择继续？", "请确认 EXE", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
-            if (op == "uninstall" && MessageBox.Show(this, "将备份并移除 " + targets.Count + " 个游戏的补丁 DLL 与 dlssg_sm86.ini。继续？", "卸载", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
+            if (op == "uninstall" && MessageBox.Show(this, "将删除 " + targets.Count + " 个游戏目录中的补丁 DLL 与 dlssg_sm86.ini。继续？", "卸载", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
 
             string verb = op == "install" ? "安装" : op == "update" ? "更新" : "卸载";
             SetBusy(true, verb + "中…"); ShowProgress(true);
@@ -732,7 +653,7 @@ namespace Sm86.Manager.App
                 var row = _list.RowFor(g);
                 try
                 {
-                    _states.TryGetValue(g, out var st);
+                    InstalledState st; lock (_states) _states.TryGetValue(g, out st);
                     if (op == "uninstall")
                     {
                         var r = await Task.Run(() => _installer.Uninstall(g));
@@ -744,17 +665,16 @@ namespace Sm86.Manager.App
                         if (op == "update")
                         {
                             if (st == null || !st.IsInstalled) { Log("· " + g.Title + "：未安装，跳过更新。"); skipped++; continue; }
-                            if (st.IsAmbiguous) { Log("· " + g.Title + "：存在多个代理 DLL，请先确认当前代理。"); skipped++; continue; }
                             proxy = st.ProxyName;
                         }
-                        var payload = await GetPayloadAsync(proxy, op == "update", memo);
-                        if (op == "update" && st.Version == payload.Tag && !st.IsModified) { Log("· " + g.Title + "：已是 " + payload.Tag + "，无需更新。"); skipped++; continue; }
+                        var payload = await GetPayloadAsync(proxy, memo);
+                        if (op == "update" && st.Version == payload.Tag) { Log("· " + g.Title + "：已是 " + payload.Tag + "，无需更新。"); skipped++; continue; }
                         var r = await Task.Run(() => _installer.Install(g, payload));
                         Log("✓ " + g.Title + "：" + r.Message); ok++;
                     }
                 }
                 catch (Exception ex) { Log("✗ " + g.Title + "：" + ex.Message); failed++; }
-                finally { if (row != null) { row.Busy = false; Bind(row); } }
+                finally { if (row != null) { row.Busy = false; await Task.Run(() => Bind(row, refresh: false)); _list.RefreshRow(row); } }
             }
             foreach (var r in _list.Rows) if (r.Busy) { r.Busy = false; _list.RefreshRow(r); }
             ShowProgress(false);
@@ -762,32 +682,7 @@ namespace Sm86.Manager.App
             if (failed > 0 && (_logPanel == null || !_logPanel.Visible)) ToggleLog();
         }
 
-        private async Task RestoreAsync(GameListView.Row row)
-        {
-            var g = row.Game; if (_busy) return;
-            var backups = _installer.ListBackups(g);
-            if (backups.Count == 0) { SetStatus("没有该游戏的备份。", transient: true); return; }
-            if (MessageBox.Show(this, "恢复「" + g.Title + "」最近一次备份（" + Path.GetFileName(backups[0]) + "）？\n当前文件会先再备份一次。", "恢复备份", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
-            SetBusy(true, "恢复中…");
-            string outcome;
-            try { var r = await Task.Run(() => _installer.RestoreLastBackup(g)); Log((r.Success ? "✓ " : "· ") + g.Title + "：" + r.Message); outcome = r.Message; }
-            catch (Exception ex) { Log("✗ " + g.Title + "：" + ex.Message); outcome = "恢复失败：" + ex.Message; }
-            Bind(row);
-            SetBusy(false, outcome);
-        }
-
         // ------------------------------------------------------------------ misc
-
-        private void ChangeTheme(string value)
-        {
-            if (_settings.Theme == value) return;
-            _settings.Theme = value; SaveSettings();
-            if (MessageBox.Show(this, "主题在重新启动后生效。现在重启管理器？", "主题", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
-            {
-                Program.ReleaseSingleInstance();
-                Application.Restart();
-            }
-        }
 
         private void OpenLogs(GameEntry g)
         {
@@ -817,7 +712,7 @@ namespace Sm86.Manager.App
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing) { _statusTimer.Dispose(); _updater.Dispose(); _steam.Dispose(); _icons.Dispose(); }
+            if (disposing) { _statusTimer.Dispose(); _updater.Cleanup(); _updater.Dispose(); _steam.Dispose(); _icons.Dispose(); }
             base.Dispose(disposing);
         }
     }

@@ -90,7 +90,6 @@ namespace Sm86.Manager
     {
         public bool IsInstalled { get; set; }
         public bool IsManaged { get; set; }
-        public bool IsModified { get; set; }
         public bool IsAmbiguous { get; set; }
         public string ProxyName { get; set; } = "";
         public string Version { get; set; } = "—";
@@ -101,15 +100,6 @@ namespace Sm86.Manager
     {
         public bool Success { get; set; }
         public string Message { get; set; } = "";
-        public string BackupDirectory { get; set; } = "";
-    }
-
-    public sealed class AppSettings
-    {
-        public string Theme { get; set; } = "system";
-        public string LocalPackageDirectory { get; set; } = "";
-        public List<string> ScanFolders { get; set; } = new List<string>();
-        public List<GameEntry> Games { get; set; } = new List<GameEntry>();
     }
 
     public interface IGameProcessGuard { void EnsureStopped(GameEntry game); }

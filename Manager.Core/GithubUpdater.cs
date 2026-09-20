@@ -5,15 +5,16 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
 namespace Sm86.Manager
 {
-    /// <summary>Resolves the latest stable GitHub release to a fixed commit and downloads individual files from it with size + git blob verification.</summary>
+    /// <summary>
+    /// Resolves the latest stable GitHub release to a fixed commit and downloads individual files from it with
+    /// size + git blob verification. Files live in a temporary folder for the lifetime of the session only.
+    /// </summary>
     public sealed class GithubUpdater : IDisposable
     {
         public const string Owner = "sdli1995";
@@ -23,16 +24,15 @@ namespace Sm86.Manager
         public string ApiBase { get; set; } = "https://api.github.com";
         public string RawBase { get; set; } = "https://raw.githubusercontent.com";
 
-        private readonly string _cacheRoot, _releasePath;
+        private readonly string _tempRoot;
         private readonly HttpClient _client;
         private readonly bool _ownsClient;
+        private readonly Dictionary<string, string> _knownHashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        public GithubUpdater(string dataDirectory, HttpClient client = null)
+        public GithubUpdater(string tempDirectory = null, HttpClient client = null)
         {
-            if (string.IsNullOrWhiteSpace(dataDirectory)) throw new ArgumentException("数据目录不能为空。", nameof(dataDirectory));
-            _cacheRoot = Path.Combine(Path.GetFullPath(dataDirectory), "cache");
-            _releasePath = Path.Combine(_cacheRoot, "release.json");
-            Directory.CreateDirectory(_cacheRoot);
+            _tempRoot = Path.GetFullPath(string.IsNullOrWhiteSpace(tempDirectory) ? Path.Combine(Path.GetTempPath(), "DLSSFG-Manager") : tempDirectory);
+            Directory.CreateDirectory(_tempRoot);
             _ownsClient = client == null;
             _client = client ?? CreateClient();
         }
@@ -47,7 +47,16 @@ namespace Sm86.Manager
             return c;
         }
 
-        public string CacheDirectory => _cacheRoot;
+        public string TempDirectory => _tempRoot;
+
+        /// <summary>sha256 → "tag" for every DLL verified this session.</summary>
+        public IReadOnlyDictionary<string, string> KnownHashes => _knownHashes;
+
+        /// <summary>Delete everything downloaded this session.</summary>
+        public void Cleanup()
+        {
+            try { if (Directory.Exists(_tempRoot)) Directory.Delete(_tempRoot, true); } catch (Exception) { }
+        }
 
         // ------------------------------------------------------------------ check
 
@@ -75,7 +84,6 @@ namespace Sm86.Manager
                 throw new IOException("上游文件清单过大被截断，无法定位补丁文件。");
             if (FindRemote(info, "version.dll") == null || FindRemote(info, InstallerService.IniName) == null)
                 throw new IOException("Release " + tag + " 对应的提交中找不到 version.dll 或 " + InstallerService.IniName + "。");
-            AtomicFile.WriteAllText(_releasePath, JsonConvert.SerializeObject(info, Formatting.Indented));
             return info;
         }
 
@@ -93,19 +101,24 @@ namespace Sm86.Manager
             return sha;
         }
 
-        public ReleaseInfo LoadCachedRelease()
-        {
-            if (!File.Exists(_releasePath)) return null;
-            try { return JsonConvert.DeserializeObject<ReleaseInfo>(File.ReadAllText(_releasePath, Encoding.UTF8)); }
-            catch (JsonException) { return null; }
-        }
-
         /// <summary>Root file first, then alternatives/; returns null when the commit does not ship that proxy.</summary>
         public static RemoteFile FindRemote(ReleaseInfo release, string name)
         {
             if (release.Files.TryGetValue(name, out var f)) return f;
             if (release.Files.TryGetValue("alternatives/" + name, out f)) return f;
             return null;
+        }
+
+        /// <summary>git blob sha1 → tag for every proxy DLL shipped by the release (lets the installer recognise deployed files).</summary>
+        public static Dictionary<string, string> ProxyBlobs(ReleaseInfo release)
+        {
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var proxy in ProxyNames.All)
+            {
+                var remote = FindRemote(release, proxy);
+                if (remote != null && !string.IsNullOrEmpty(remote.BlobSha)) map[remote.BlobSha] = release.Tag;
+            }
+            return map;
         }
 
         // ------------------------------------------------------------------ download
@@ -115,60 +128,18 @@ namespace Sm86.Manager
             if (release == null) throw new ArgumentNullException(nameof(release));
             if (!ProxyNames.IsSupported(proxyName)) throw new ArgumentException("不支持的代理 DLL：" + proxyName, nameof(proxyName));
             proxyName = proxyName.ToLowerInvariant();
-            var folder = ReleaseCacheFolder(release);
+            var folder = Path.Combine(_tempRoot, string.IsNullOrEmpty(release.Commit) ? "unknown" : release.Commit.Substring(0, Math.Min(12, release.Commit.Length)));
             Directory.CreateDirectory(folder);
             var proxyRemote = FindRemote(release, proxyName) ?? throw new IOException("Release " + release.Tag + " 中没有 " + proxyName + "。");
             var iniRemote = FindRemote(release, InstallerService.IniName) ?? throw new IOException("Release " + release.Tag + " 中没有默认配置。");
-            var noticesRemote = FindRemote(release, ThirdPartyNoticesName);
 
             var proxyPath = await FetchVerifiedAsync(release, proxyRemote, Path.Combine(folder, proxyName), cancellationToken, progress).ConfigureAwait(false);
             var iniPath = await FetchVerifiedAsync(release, iniRemote, Path.Combine(folder, InstallerService.IniName), cancellationToken, progress).ConfigureAwait(false);
-            if (noticesRemote != null)
-            {
-                try { await FetchVerifiedAsync(release, noticesRemote, Path.Combine(folder, ThirdPartyNoticesName), cancellationToken, progress).ConfigureAwait(false); }
-                catch (Exception ex) when (ex is IOException || ex is HttpRequestException) { /* notices are informational */ }
-            }
             var pe = PeInspector.Read(proxyPath);
             if (pe == null || !pe.IsDll || !pe.Is64Bit) { File.Delete(proxyPath); throw new IOException("下载的 " + proxyName + " 不是 64 位 DLL，已丢弃。"); }
             var payload = new PatchPayload { ProxyName = proxyName, ProxyPath = proxyPath, IniPath = iniPath, Tag = release.Tag, Commit = release.Commit, Sha256 = FileIntegrity.Sha256(proxyPath) };
-            RecordHash(payload);
+            _knownHashes[payload.Sha256] = release.Tag;
             return payload;
-        }
-
-        /// <summary>Return a payload from the cache without any network use, or null if the cache is incomplete or fails verification.</summary>
-        public PatchPayload LoadCachedPayload(ReleaseInfo release, string proxyName)
-        {
-            if (release == null || !ProxyNames.IsSupported(proxyName)) return null;
-            proxyName = proxyName.ToLowerInvariant();
-            var folder = ReleaseCacheFolder(release);
-            var proxyPath = Path.Combine(folder, proxyName);
-            var iniPath = Path.Combine(folder, InstallerService.IniName);
-            var proxyRemote = FindRemote(release, proxyName); var iniRemote = FindRemote(release, InstallerService.IniName);
-            if (proxyRemote == null || iniRemote == null || !Verify(proxyRemote, proxyPath) || !Verify(iniRemote, iniPath)) return null;
-            return new PatchPayload { ProxyName = proxyName, ProxyPath = proxyPath, IniPath = iniPath, Tag = release.Tag, Commit = release.Commit, Sha256 = FileIntegrity.Sha256(proxyPath) };
-        }
-
-        /// <summary>sha256 → "tag (commit)" for every verified DLL ever downloaded; lets the installer label hand-installed copies.</summary>
-        public Dictionary<string, string> KnownHashes()
-        {
-            var path = Path.Combine(_cacheRoot, "known-hashes.json");
-            if (!File.Exists(path)) return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            try { return new Dictionary<string, string>(JsonConvert.DeserializeObject<Dictionary<string, string>>(File.ReadAllText(path, Encoding.UTF8)) ?? new Dictionary<string, string>(), StringComparer.OrdinalIgnoreCase); }
-            catch (JsonException) { return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); }
-        }
-
-        private void RecordHash(PatchPayload payload)
-        {
-            var known = KnownHashes();
-            known[payload.Sha256] = InstallerService.VersionLabel(payload.Tag, payload.Commit);
-            AtomicFile.WriteAllText(Path.Combine(_cacheRoot, "known-hashes.json"), JsonConvert.SerializeObject(known, Formatting.Indented));
-        }
-
-        private string ReleaseCacheFolder(ReleaseInfo release)
-        {
-            var safeTag = new string(release.Tag.Where(c => !Path.GetInvalidFileNameChars().Contains(c)).ToArray());
-            var commit = string.IsNullOrEmpty(release.Commit) ? "unknown" : release.Commit.Substring(0, Math.Min(12, release.Commit.Length));
-            return Path.Combine(_cacheRoot, safeTag + "-" + commit);
         }
 
         private static bool Verify(RemoteFile remote, string path)
@@ -180,7 +151,7 @@ namespace Sm86.Manager
 
         private async Task<string> FetchVerifiedAsync(ReleaseInfo release, RemoteFile remote, string destination, CancellationToken ct, IProgress<TransferProgress> progress)
         {
-            if (Verify(remote, destination)) { progress?.Report(new TransferProgress { Message = "使用已校验缓存：" + remote.RelativePath, Received = remote.Size, Total = remote.Size }); return destination; }
+            if (Verify(remote, destination)) { progress?.Report(new TransferProgress { Message = "已下载：" + remote.RelativePath, Received = remote.Size, Total = remote.Size }); return destination; }
             var url = RawBase + "/" + Owner + "/" + Repo + "/" + release.Commit + "/" + remote.RelativePath;
             var tmp = destination + ".download";
             try
@@ -189,7 +160,7 @@ namespace Sm86.Manager
                 {
                     await ThrowIfFailed(response, url).ConfigureAwait(false);
                     long total = response.Content.Headers.ContentLength ?? remote.Size;
-                    using (var source = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
+                    using (var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false))
                     using (var file = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
                     {
                         var buffer = new byte[81920]; long received = 0; int read;
@@ -217,7 +188,7 @@ namespace Sm86.Manager
             using (response)
             {
                 await ThrowIfFailed(response, url).ConfigureAwait(false);
-                return await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                return await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             }
         }
 
@@ -242,26 +213,5 @@ namespace Sm86.Manager
         private static Exception Root(Exception ex) { while (ex.InnerException != null) ex = ex.InnerException; return ex; }
 
         public void Dispose() { if (_ownsClient) _client.Dispose(); }
-    }
-
-    /// <summary>Loads a patch from a local upstream checkout / release folder without moving anything.</summary>
-    public static class LocalPackage
-    {
-        public static PatchPayload Open(string directory, string proxyName, IDictionary<string, string> knownHashes = null)
-        {
-            if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory)) throw new DirectoryNotFoundException("本地补丁目录不存在：" + directory);
-            if (!ProxyNames.IsSupported(proxyName)) throw new ArgumentException("不支持的代理 DLL：" + proxyName, nameof(proxyName));
-            proxyName = proxyName.ToLowerInvariant();
-            var proxyPath = new[] { Path.Combine(directory, proxyName), Path.Combine(directory, "alternatives", proxyName), Path.Combine(directory, "altnative", proxyName) }.FirstOrDefault(File.Exists)
-                ?? throw new FileNotFoundException("本地补丁目录中没有 " + proxyName + "（根目录或 alternatives\\ 下）。");
-            var iniPath = Path.Combine(directory, InstallerService.IniName);
-            if (!File.Exists(iniPath)) throw new FileNotFoundException("本地补丁目录缺少 " + InstallerService.IniName + "。");
-            var pe = PeInspector.Read(proxyPath);
-            if (pe == null || !pe.IsDll || !pe.Is64Bit) throw new InvalidDataException(proxyPath + " 不是 64 位 DLL。");
-            var sha = FileIntegrity.Sha256(proxyPath);
-            var tag = "本地补丁";
-            if (knownHashes != null && knownHashes.TryGetValue(sha, out var label)) tag = label;
-            return new PatchPayload { ProxyName = proxyName, ProxyPath = proxyPath, IniPath = iniPath, Tag = tag, Commit = "", Sha256 = sha };
-        }
     }
 }
